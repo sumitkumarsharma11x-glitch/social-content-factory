@@ -1,155 +1,180 @@
-/**
- * Generate Batch API Route
- * ---------------------------------
- * Thin bridge between the Teacher Generation UI and the existing,
- * unmodified generate-batch-usecase.ts. Two pieces:
- *
- *  1. handleGenerateBatchRequest() — a pure async function (no Express
- *     types in its signature) that does the actual work: resolve the
- *     teacher-chosen provider explicitly (no fallback, same rule as
- *     ProviderSelector), build a ContentGenerator, call generateBatch(),
- *     and on success load the persisted pieces back out so the UI has
- *     something to render. This is what's unit-tested.
- *  2. registerGenerateBatchRoute() — wraps (1) in an Express handler.
- *     Not unit-tested directly (thin enough that testing (1) covers the
- *     real logic); would be covered by an integration/HTTP test later.
- */
-
-import type { Request, Response, Router } from "express";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
-import { GeminiProvider, ClaudeProvider, OllamaProvider, MockProvider, type AIProvider, type ProviderName } from "./provider-selector";
-import { createContentGenerator } from "./content-generator";
-import { generateBatch, type GenerateBatchResult } from "./generate-batch-usecase";
-import { listPieces, type PieceRecord } from "./persistence";
+import { openDatabase } from "../src/db";
+import { handleGenerateBatchRequest } from "../src/generate-batch-route";
+import { getBatch } from "../src/persistence";
+import { generateMockContentBatch } from "../src/mock-content-batch";
+import { TOTAL_PIECES, PIECES_PER_PLATFORM, PLATFORMS } from "../src/content-schema";
+import type { ContentGenerator, GenerationRequest, GenerationResult } from "../src/content-generator";
+import type { AIProvider, ProviderName } from "../src/provider-selector";
 
-export interface GenerateBatchRequestBody {
-  topic: string;
-  provider: ProviderName;
+let db: Database.Database;
+
+beforeEach(() => {
+  db = openDatabase(":memory:");
+});
+
+afterEach(() => {
+  db.close();
+});
+
+function countRows(table: "batches" | "pieces"): number {
+  return (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
 }
 
-export interface GenerateBatchApiSuccess {
-  ok: true;
-  batchId: number;
-  attempts: number;
-  pieces: PieceRecord[];
-}
-
-export interface GenerateBatchApiFailure {
-  ok: false;
-  stage: string;
-  message: string;
-  validationErrors?: string[];
-}
-
-export type GenerateBatchApiResult = GenerateBatchApiSuccess | GenerateBatchApiFailure;
-
-/**
- * Resolves a UI-selected provider name into a concrete AIProvider using
- * the same explicit, no-fallback construction ProviderSelector uses
- * internally — this reads credentials from the environment, exactly like
- * every generator already does, rather than trusting the client for them.
- */
-function resolveTeacherSelectedProvider(
-  provider: ProviderName,
-  env: NodeJS.ProcessEnv
-): { provider: AIProvider; model: string } | { error: string } {
-  switch (provider) {
-    case "gemini": {
-      const apiKey = env.GEMINI_API_KEY || env.GOOGLE_API_KEY;
-      const model = env.GEMINI_MODEL;
-      if (!apiKey) return { error: "Gemini is not configured (missing GEMINI_API_KEY)." };
-      if (!model) return { error: "Gemini is not configured (missing GEMINI_MODEL)." };
-      return { provider: GeminiProvider.fromConfig({ apiKey }), model };
-    }
-    case "claude": {
-      const apiKey = env.ANTHROPIC_API_KEY;
-      const model = env.CLAUDE_MODEL;
-      if (!apiKey) return { error: "Claude is not configured (missing ANTHROPIC_API_KEY)." };
-      if (!model) return { error: "Claude is not configured (missing CLAUDE_MODEL)." };
-      return { provider: ClaudeProvider.fromConfig({ apiKey }), model };
-    }
-    case "ollama": {
-      const host = env.OLLAMA_HOST;
-      const model = env.OLLAMA_MODEL;
-      if (!host) return { error: "Ollama is not configured (missing OLLAMA_HOST)." };
-      if (!model) return { error: "Ollama is not configured (missing OLLAMA_MODEL)." };
-      return { provider: OllamaProvider.fromConfig({ host, model }), model };
-    }
-    case "mock": {
-      // Mock needs no credentials and no external config — it's meant to
-      // work out of the box for testing/demo without touching Gemini,
-      // Claude, or Ollama's configuration requirements at all.
-      const model = env.MOCK_MODEL || "mock-v1";
-      return { provider: MockProvider.fromConfig({}), model };
-    }
-    default:
-      return { error: `Unsupported provider "${provider}". Choose gemini, claude, ollama, or mock.` };
+/** Fake ContentGenerator standing in for the real network call. */
+class FakeGenerator implements ContentGenerator {
+  public calls: GenerationRequest[] = [];
+  constructor(public readonly provider: ProviderName, private readonly queue: GenerationResult[]) {}
+  async generate(request: GenerationRequest): Promise<GenerationResult> {
+    this.calls.push(request);
+    const next = this.queue.shift();
+    if (!next) throw new Error("FakeGenerator ran out of queued results");
+    return next;
   }
 }
 
-export async function handleGenerateBatchRequest(
-  body: GenerateBatchRequestBody,
-  deps: {
-    db: Database.Database;
-    env?: NodeJS.ProcessEnv;
-    /**
-     * Optional override for how a resolved AIProvider becomes a
-     * ContentGenerator. Defaults to the real createContentGenerator.
-     * Exists purely so tests can inject a fake generator at the one
-     * legitimate seam (the outbound AI call) without touching
-     * generateBatch, validateContentBatch, or saveValidatedBatch — all of
-     * which remain the real, unmodified implementations.
-     */
-    createGenerator?: (provider: AIProvider) => ReturnType<typeof createContentGenerator>;
-  }
-): Promise<{ status: number; result: GenerateBatchApiResult }> {
-  const topic = body?.topic?.trim();
-  if (!topic) {
-    return { status: 400, result: { ok: false, stage: "input", message: "Topic/Chapter is required." } };
-  }
-  if (!body?.provider) {
-    return { status: 400, result: { ok: false, stage: "input", message: "Provider selection is required." } };
-  }
+function successResult(provider: ProviderName, content: string): GenerationResult {
+  return { ok: true, provider, content, durationMs: 5 };
+}
 
-  const resolved = resolveTeacherSelectedProvider(body.provider, deps.env ?? process.env);
-  if ("error" in resolved) {
-    return { status: 422, result: { ok: false, stage: "provider_guard", message: resolved.error } };
-  }
+const fullyConfiguredEnv = {
+  GEMINI_API_KEY: "fake-gemini-key",
+  GEMINI_MODEL: "gemini-2.5-flash",
+  ANTHROPIC_API_KEY: "fake-claude-key",
+  CLAUDE_MODEL: "claude-sonnet-4-6",
+  OLLAMA_HOST: "http://localhost:11434",
+  OLLAMA_MODEL: "llama3",
+} as unknown as NodeJS.ProcessEnv;
 
-  const buildGenerator = deps.createGenerator ?? createContentGenerator;
-  const generator = buildGenerator(resolved.provider);
-
-  const useCaseResult: GenerateBatchResult = await generateBatch({
-    topic,
-    generator,
-    model: resolved.model,
-    db: deps.db,
+describe("handleGenerateBatchRequest — input validation", () => {
+  it("returns 400 when topic is missing", async () => {
+    const { status, result } = await handleGenerateBatchRequest(
+      { topic: "", provider: "claude" },
+      { db, env: fullyConfiguredEnv }
+    );
+    expect(status).toBe(400);
+    expect(result.ok).toBe(false);
   });
 
-  if (!useCaseResult.ok) {
-    const status = useCaseResult.stage === "provider_guard" ? 422 : 502;
-    return {
-      status,
-      result: {
-        ok: false,
-        stage: useCaseResult.stage,
-        message: useCaseResult.message,
-        validationErrors: useCaseResult.validationErrors,
-      },
-    };
-  }
-
-  const pieces = listPieces(deps.db, useCaseResult.batchId);
-  return {
-    status: 201,
-    result: { ok: true, batchId: useCaseResult.batchId, attempts: useCaseResult.attempts, pieces },
-  };
-}
-
-/** Registers POST /api/batches/generate on an existing Express Router/app. */
-export function registerGenerateBatchRoute(router: Router, db: Database.Database): void {
-  router.post("/api/batches/generate", async (req: Request, res: Response) => {
-    const { status, result } = await handleGenerateBatchRequest(req.body, { db });
-    res.status(status).json(result);
+  it("returns 400 when provider is missing", async () => {
+    const { status, result } = await handleGenerateBatchRequest(
+      { topic: "photosynthesis" } as any,
+      { db, env: fullyConfiguredEnv }
+    );
+    expect(status).toBe(400);
+    expect(result.ok).toBe(false);
   });
-}
+});
+
+describe("handleGenerateBatchRequest — provider guard (server-side config only)", () => {
+  it("returns 422 when Gemini is not configured", async () => {
+    const { status, result } = await handleGenerateBatchRequest(
+      { topic: "photosynthesis", provider: "gemini" },
+      { db, env: { ...fullyConfiguredEnv, GEMINI_API_KEY: undefined } as any }
+    );
+    expect(status).toBe(422);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.stage).toBe("provider_guard");
+  });
+
+  it("returns 422 when Claude is not configured", async () => {
+    const { status, result } = await handleGenerateBatchRequest(
+      { topic: "photosynthesis", provider: "claude" },
+      { db, env: { ...fullyConfiguredEnv, CLAUDE_MODEL: undefined } as any }
+    );
+    expect(status).toBe(422);
+    expect(result.ok).toBe(false);
+  });
+
+  it("returns 422 when Ollama is not configured", async () => {
+    const { status, result } = await handleGenerateBatchRequest(
+      { topic: "photosynthesis", provider: "ollama" },
+      { db, env: { ...fullyConfiguredEnv, OLLAMA_HOST: undefined } as any }
+    );
+    expect(status).toBe(422);
+    expect(result.ok).toBe(false);
+  });
+
+  it("returns 422 for a genuinely unsupported provider value", async () => {
+    const { status, result } = await handleGenerateBatchRequest(
+      { topic: "photosynthesis", provider: "not-a-real-provider" as any },
+      { db, env: fullyConfiguredEnv }
+    );
+    expect(status).toBe(422);
+    expect(result.ok).toBe(false);
+  });
+
+  it("never exposes credentials in the response even on failure", async () => {
+    const { result } = await handleGenerateBatchRequest(
+      { topic: "photosynthesis", provider: "gemini" },
+      { db, env: { ...fullyConfiguredEnv, GEMINI_API_KEY: undefined } as any }
+    );
+    expect(JSON.stringify(result)).not.toContain("fake-gemini-key");
+  });
+});
+
+describe("handleGenerateBatchRequest — mock provider (no credentials required)", () => {
+  it("returns 201 with 30 persisted pieces using the REAL mock generator (no injection, no network)", async () => {
+    const { status, result } = await handleGenerateBatchRequest(
+      { topic: "photosynthesis", provider: "mock" },
+      { db, env: {} as any } // deliberately empty env: mock must not require any config
+    );
+
+    expect(status).toBe(201);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.pieces).toHaveLength(TOTAL_PIECES);
+      const batch = getBatch(db, result.batchId);
+      expect(batch?.provider).toBe("mock");
+      expect(batch?.status).toBe("draft");
+    }
+  });
+});
+
+describe("handleGenerateBatchRequest — end-to-end via injected generator", () => {
+  it("returns 201 with 30 persisted pieces on success (real generateBatch + real saveValidatedBatch)", async () => {
+    const fake = new FakeGenerator("claude", [successResult("claude", JSON.stringify(generateMockContentBatch("photosynthesis")))]);
+
+    const { status, result } = await handleGenerateBatchRequest(
+      { topic: "photosynthesis", provider: "claude" },
+      { db, env: fullyConfiguredEnv, createGenerator: () => fake }
+    );
+
+    expect(status).toBe(201);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.pieces).toHaveLength(TOTAL_PIECES);
+      for (const platform of PLATFORMS) {
+        expect(result.pieces.filter((p) => p.platform === platform)).toHaveLength(PIECES_PER_PLATFORM);
+      }
+      const batch = getBatch(db, result.batchId);
+      expect(batch?.status).toBe("draft");
+      expect(batch?.provider).toBe("claude");
+      expect(batch?.model).toBe("claude-sonnet-4-6");
+    }
+  });
+
+  it("returns 502 and persists nothing when generation fails validation after retries", async () => {
+    const badBatch = generateMockContentBatch("x");
+    badBatch.pieces.pop(); // 29 pieces -> invalid
+    const fake = new FakeGenerator("gemini", [
+      successResult("gemini", JSON.stringify(badBatch)),
+      successResult("gemini", JSON.stringify(badBatch)),
+    ]);
+
+    const { status, result } = await handleGenerateBatchRequest(
+      { topic: "x", provider: "gemini" },
+      { db, env: fullyConfiguredEnv, createGenerator: () => fake }
+    );
+
+    expect(status).toBe(502);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.stage).toBe("validation");
+      expect(result.validationErrors && result.validationErrors.length).toBeGreaterThan(0);
+    }
+    expect(countRows("batches")).toBe(0);
+    expect(countRows("pieces")).toBe(0);
+  });
+});
