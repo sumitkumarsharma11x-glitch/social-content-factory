@@ -21,7 +21,7 @@ import { validateContentBatch, type ContentBatch } from "./content-schema";
 import { saveValidatedBatch, type SaveBatchResult } from "./persistence";
 
 /** Providers this feature is allowed to run against, per product scope. */
-const SUPPORTED_PROVIDERS: ProviderName[] = ["gemini", "claude", "ollama"];
+const SUPPORTED_PROVIDERS: ProviderName[] = ["gemini", "claude", "ollama", "mock"];
 
 export type GenerateBatchFailureStage =
   | "provider_guard"
@@ -74,7 +74,7 @@ export async function generateBatch(input: GenerateBatchInput): Promise<Generate
     return {
       ok: false,
       stage: "provider_guard",
-      message: `This feature requires provider "gemini", "claude", or "ollama"; got "${providerName}".`,
+      message: `This feature requires provider "gemini", "claude", "ollama", or "mock"; got "${providerName}".`,
       attempts: 0,
     };
   }
