@@ -1,0 +1,284 @@
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&display=swap");
+
+:root {
+  --bg: #14261f;
+  --panel: #1b322a;
+  --ink: #f1ecdd;
+  --muted: #9bb0a4;
+  --accent: #e7b24b;
+  --accent-ink: #1c1204;
+  --approve: #6f9d7a;
+  --reject: #c1553a;
+  --border: #2c463c;
+}
+
+.rd-page {
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Inter", system-ui, sans-serif;
+  padding: 2rem 1.25rem 4rem;
+}
+
+.rd-header {
+  max-width: 760px;
+  margin: 0 auto 1.5rem;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.rd-mark {
+  font-family: "Fraunces", serif;
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+
+.rd-progress {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.rd-empty {
+  text-align: center;
+  color: var(--muted);
+}
+
+.rd-error {
+  max-width: 640px;
+  margin: 2rem auto;
+  background: var(--panel);
+  border: 1px solid var(--reject);
+  border-radius: 4px;
+  padding: 1.25rem 1.5rem;
+}
+
+.rd-error-title {
+  color: var(--reject);
+  font-weight: 600;
+  margin: 0 0 0.4rem;
+}
+
+.rd-tabs {
+  max-width: 760px;
+  margin: 0 auto 1.5rem;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.rd-tab {
+  flex: 1;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 500;
+  padding: 0.6rem 0.5rem;
+  cursor: pointer;
+}
+
+.rd-tab--active {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: #22392f;
+}
+
+.rd-piece-list {
+  max-width: 760px;
+  margin: 0 auto;
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.rd-piece {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1.1rem 1.25rem 1.25rem;
+}
+
+.rd-piece-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.rd-piece-number {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.rd-status {
+  font-size: 0.8rem;
+  font-weight: 500;
+  padding: 0.2rem 0.6rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.rd-status--pending {
+  color: var(--muted);
+}
+
+.rd-status--edited {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+.rd-status--approved {
+  color: var(--approve);
+  border-color: var(--approve);
+}
+
+.rd-status--rejected {
+  color: var(--reject);
+  border-color: var(--reject);
+}
+
+.rd-piece-title {
+  font-family: "Fraunces", serif;
+  font-weight: 600;
+  font-size: 1.1rem;
+  margin: 0 0 0.4rem;
+}
+
+.rd-piece-body {
+  font-size: 0.9rem;
+  line-height: 1.5;
+  margin: 0 0 0.5rem;
+  color: var(--ink);
+}
+
+.rd-piece-hashtags,
+.rd-piece-cta {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 0 0 0.25rem;
+}
+
+.rd-piece-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.85rem;
+}
+
+.rd-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--ink);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 500;
+  padding: 0.45rem 0.9rem;
+  cursor: pointer;
+}
+
+.rd-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.rd-btn--approve {
+  border-color: var(--approve);
+  color: var(--approve);
+}
+
+.rd-btn--reject {
+  border-color: var(--reject);
+  color: var(--reject);
+}
+
+.rd-btn--save {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.rd-edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.rd-field-label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-top: 0.5rem;
+}
+
+.rd-input,
+.rd-textarea {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 0.5rem 0.65rem;
+}
+
+.rd-textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.rd-piece-error {
+  margin: 0.6rem 0 0;
+  color: var(--reject);
+  font-size: 0.85rem;
+}
+
+/* Batch History list */
+
+.bh-list {
+  max-width: 760px;
+  margin: 0 auto;
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.bh-row {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.bh-row-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.bh-row-title {
+  font-family: "Fraunces", serif;
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+
+.bh-row-meta {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.bh-back {
+  max-width: 760px;
+  margin: 0 auto 1rem;
+  display: flex;
+}
