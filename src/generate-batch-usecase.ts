@@ -1,166 +1,188 @@
-/**
- * Generate Batch Use-Case
- * ---------------------------------
- * Wires together, in order: provider guard -> prompt builder -> an
- * already-resolved ContentGenerator -> response parser -> validateContentBatch
- * (existing, unmodified) -> saveValidatedBatch (existing, unmodified).
- *
- * No fallback: on a failed attempt, at most `maxAttempts` retries happen
- * against the SAME generator instance (same provider identity) with
- * corrective feedback appended to the prompt. If still invalid, the whole
- * call fails and NOTHING is persisted — saveValidatedBatch is only ever
- * called once, with an already-validated batch, on the success path.
- */
-
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
-import type { ContentGenerator } from "./content-generator";
-import type { ProviderName } from "./provider-selector";
-import { buildGenerateBatchPrompt, buildRetryPrompt } from "./content-prompt-builder";
-import { parseBatchContent } from "./content-response-parser";
-import { validateContentBatch, type ContentBatch } from "./content-schema";
-import { saveValidatedBatch, type SaveBatchResult } from "./persistence";
+import { openDatabase } from "../src/db";
+import { generateBatch } from "../src/generate-batch-usecase";
+import { generateMockContentBatch } from "../src/mock-content-batch";
+import type { ContentGenerator, GenerationRequest, GenerationResult } from "../src/content-generator";
+import type { ProviderName } from "../src/provider-selector";
+import { getBatch, listPieces } from "../src/persistence";
+import { TOTAL_PIECES, PIECES_PER_PLATFORM, PLATFORMS } from "../src/content-schema";
 
-/** Providers this feature is allowed to run against, per product scope. */
-const SUPPORTED_PROVIDERS: ProviderName[] = ["gemini", "claude", "ollama", "mock"];
+let db: Database.Database;
 
-export type GenerateBatchFailureStage =
-  | "provider_guard"
-  | "generation"
-  | "parsing"
-  | "validation"
-  | "persistence";
+beforeEach(() => {
+  db = openDatabase(":memory:");
+});
 
-export interface GenerateBatchInput {
-  topic: string;
-  /** Already resolved via ProviderSelector -> createContentGenerator. Not re-resolved here. */
-  generator: ContentGenerator;
-  /** The actual model string configured for this generator (recorded on the persisted batch). */
-  model: string;
-  db: Database.Database;
-  /** Max attempts against the SAME generator before giving up. Default 2. Never switches provider. */
-  maxAttempts?: number;
-  timeoutMs?: number;
-  maxOutputTokens?: number;
-}
+afterEach(() => {
+  db.close();
+});
 
-export interface GenerateBatchSuccess {
-  ok: true;
-  batchId: number;
-  pieceIds: number[];
-  attempts: number;
-}
+/** Scriptable fake ContentGenerator: returns queued results, one per call. */
+class ScriptedGenerator implements ContentGenerator {
+  public calls: GenerationRequest[] = [];
+  constructor(public readonly provider: ProviderName, private readonly queue: GenerationResult[]) {}
 
-export interface GenerateBatchFailure {
-  ok: false;
-  stage: GenerateBatchFailureStage;
-  message: string;
-  attempts: number;
-  /** Populated when stage is "validation" (or a parsing failure carried into it). */
-  validationErrors?: string[];
-}
-
-export type GenerateBatchResult = GenerateBatchSuccess | GenerateBatchFailure;
-
-const DEFAULT_MAX_ATTEMPTS = 2;
-const DEFAULT_TIMEOUT_MS = 60_000;
-const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
-
-/** Error categories worth retrying (same provider) before giving up. */
-const RETRYABLE_GENERATION_CATEGORIES = new Set(["timeout", "network", "rate_limit", "provider_error"]);
-
-export async function generateBatch(input: GenerateBatchInput): Promise<GenerateBatchResult> {
-  const providerName = input.generator.provider;
-  if (!SUPPORTED_PROVIDERS.includes(providerName)) {
-    return {
-      ok: false,
-      stage: "provider_guard",
-      message: `This feature requires provider "gemini", "claude", "ollama", or "mock"; got "${providerName}".`,
-      attempts: 0,
-    };
+  async generate(request: GenerationRequest): Promise<GenerationResult> {
+    this.calls.push(request);
+    const next = this.queue.shift();
+    if (!next) throw new Error("ScriptedGenerator ran out of queued results");
+    return next;
   }
-
-  const maxAttempts = input.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
-  const { prompt: basePrompt, structuredOutput } = buildGenerateBatchPrompt(input.topic);
-
-  let currentPrompt = basePrompt;
-  let lastErrors: string[] = [];
-  let attempt = 0;
-
-  while (attempt < maxAttempts) {
-    attempt++;
-
-    const genResult = await input.generator.generate({
-      prompt: currentPrompt,
-      timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      options: {
-        maxTokens: input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-        structuredOutput,
-      },
-    });
-
-    if (!genResult.ok) {
-      const canRetry = attempt < maxAttempts && RETRYABLE_GENERATION_CATEGORIES.has(genResult.error.category);
-      if (canRetry) continue; // same provider, same prompt, just try again
-      return {
-        ok: false,
-        stage: "generation",
-        message: genResult.error.message,
-        attempts: attempt,
-      };
-    }
-
-    const parsed = parseBatchContent(genResult.content);
-    if (!parsed.ok) {
-      lastErrors = [parsed.message];
-      if (attempt < maxAttempts) {
-        currentPrompt = buildRetryPrompt(basePrompt, lastErrors);
-        continue;
-      }
-      return { ok: false, stage: "parsing", message: parsed.message, attempts: attempt };
-    }
-
-    const validation = validateContentBatch(parsed.data);
-    if (!validation.valid) {
-      lastErrors = validation.errors;
-      if (attempt < maxAttempts) {
-        currentPrompt = buildRetryPrompt(basePrompt, lastErrors);
-        continue;
-      }
-      return {
-        ok: false,
-        stage: "validation",
-        message: `Batch failed validation after ${attempt} attempt(s).`,
-        attempts: attempt,
-        validationErrors: lastErrors,
-      };
-    }
-
-    // Valid: persist exactly once, via the existing, unmodified persistence layer.
-    let saveResult: SaveBatchResult;
-    try {
-      saveResult = saveValidatedBatch(input.db, {
-        provider: providerName,
-        model: input.model,
-        batch: parsed.data as ContentBatch,
-      });
-    } catch (err) {
-      return {
-        ok: false,
-        stage: "persistence",
-        message: err instanceof Error ? err.message : "Failed to persist the generated batch.",
-        attempts: attempt,
-      };
-    }
-
-    return { ok: true, batchId: saveResult.batchId, pieceIds: saveResult.pieceIds, attempts: attempt };
-  }
-
-  // Unreachable in practice (every loop iteration returns or continues within
-  // the attempt budget), kept as an explicit exhaustive fallback.
-  return {
-    ok: false,
-    stage: "generation",
-    message: "Exhausted all attempts without a successful generation.",
-    attempts: attempt,
-  };
 }
+
+function validBatchJson(): string {
+  return JSON.stringify(generateMockContentBatch("photosynthesis"));
+}
+
+function successResult(provider: ProviderName, content: string): GenerationResult {
+  return { ok: true, provider, content, durationMs: 5 };
+}
+
+function failureResult(provider: ProviderName, category: any, message = "boom"): GenerationResult {
+  return { ok: false, provider, error: { category, code: `${provider}.x`, message }, durationMs: 5 };
+}
+
+function countRows(table: "batches" | "pieces"): number {
+  return (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+}
+
+describe("generateBatch", () => {
+  it("rejects a genuinely unsupported provider with stage=provider_guard and persists nothing", async () => {
+    const generator = new ScriptedGenerator("legacy-model" as any, []);
+    const result = await generateBatch({ topic: "fractions", generator, model: "n/a", db });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.stage).toBe("provider_guard");
+    expect(countRows("batches")).toBe(0);
+    expect(countRows("pieces")).toBe(0);
+  });
+
+  it("accepts mock and generates+persists successfully (mock is a supported provider for this feature)", async () => {
+    const generator = new ScriptedGenerator("mock", [successResult("mock", validBatchJson())]);
+
+    const result = await generateBatch({ topic: "fractions", generator, model: "mock-v1", db });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.attempts).toBe(1);
+      expect(result.pieceIds).toHaveLength(TOTAL_PIECES);
+      const batch = getBatch(db, result.batchId);
+      expect(batch?.provider).toBe("mock");
+    }
+  });
+
+  it("succeeds on the first attempt: generates, validates, and saves as draft", async () => {
+    const generator = new ScriptedGenerator("claude", [successResult("claude", validBatchJson())]);
+
+    const result = await generateBatch({ topic: "photosynthesis", generator, model: "claude-sonnet-4-6", db });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.attempts).toBe(1);
+      expect(result.pieceIds).toHaveLength(TOTAL_PIECES);
+
+      const batch = getBatch(db, result.batchId);
+      expect(batch?.status).toBe("draft");
+      expect(batch?.provider).toBe("claude");
+      expect(batch?.model).toBe("claude-sonnet-4-6");
+
+      const pieces = listPieces(db, result.batchId);
+      expect(pieces).toHaveLength(TOTAL_PIECES);
+      for (const platform of PLATFORMS) {
+        expect(pieces.filter((p) => p.platform === platform)).toHaveLength(PIECES_PER_PLATFORM);
+      }
+    }
+    expect(generator.calls).toHaveLength(1);
+  });
+
+  it("retries the SAME generator on invalid JSON, then succeeds on attempt 2", async () => {
+    const generator = new ScriptedGenerator("gemini", [
+      successResult("gemini", "not json at all {{{"),
+      successResult("gemini", validBatchJson()),
+    ]);
+
+    const result = await generateBatch({ topic: "gravity", generator, model: "gemini-2.5-flash", db, maxAttempts: 2 });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.attempts).toBe(2);
+    expect(generator.calls).toHaveLength(2);
+    // Second call's prompt should carry corrective feedback.
+    expect(generator.calls[1].prompt).toContain("previous attempt did not match");
+  });
+
+  it("retries on a schema-invalid (but parseable) batch, then succeeds", async () => {
+    const badBatch = generateMockContentBatch("x");
+    badBatch.pieces.pop(); // 29 pieces -> invalid
+    const generator = new ScriptedGenerator("claude", [
+      successResult("claude", JSON.stringify(badBatch)),
+      successResult("claude", validBatchJson()),
+    ]);
+
+    const result = await generateBatch({ topic: "x", generator, model: "claude-sonnet-4-6", db, maxAttempts: 2 });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.attempts).toBe(2);
+  });
+
+  it("fails with stage=validation and persists NOTHING after exhausting retries on invalid content", async () => {
+    const badBatch = generateMockContentBatch("x");
+    badBatch.pieces.pop();
+    const generator = new ScriptedGenerator("claude", [
+      successResult("claude", JSON.stringify(badBatch)),
+      successResult("claude", JSON.stringify(badBatch)),
+    ]);
+
+    const result = await generateBatch({ topic: "x", generator, model: "claude-sonnet-4-6", db, maxAttempts: 2 });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.stage).toBe("validation");
+      expect(result.attempts).toBe(2);
+      expect(result.validationErrors && result.validationErrors.length).toBeGreaterThan(0);
+    }
+    expect(countRows("batches")).toBe(0);
+    expect(countRows("pieces")).toBe(0);
+  });
+
+  it("retries a retryable generation failure (timeout) on the SAME provider, then succeeds", async () => {
+    const generator = new ScriptedGenerator("gemini", [
+      failureResult("gemini", "timeout"),
+      successResult("gemini", validBatchJson()),
+    ]);
+
+    const result = await generateBatch({ topic: "x", generator, model: "gemini-2.5-flash", db, maxAttempts: 2 });
+
+    expect(result.ok).toBe(true);
+    expect(generator.calls).toHaveLength(2);
+    // Never a different provider: the same ScriptedGenerator instance (provider="gemini") was reused.
+    expect(generator.provider).toBe("gemini");
+  });
+
+  it("does NOT retry a non-retryable generation failure (authentication) and persists nothing", async () => {
+    const generator = new ScriptedGenerator("claude", [failureResult("claude", "authentication")]);
+
+    const result = await generateBatch({ topic: "x", generator, model: "claude-sonnet-4-6", db, maxAttempts: 3 });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.stage).toBe("generation");
+      expect(result.attempts).toBe(1);
+    }
+    expect(generator.calls).toHaveLength(1); // no retry attempted
+    expect(countRows("batches")).toBe(0);
+  });
+
+  it("respects a custom maxAttempts of 1 (no retries at all)", async () => {
+    const generator = new ScriptedGenerator("claude", [successResult("claude", "not json")]);
+
+    const result = await generateBatch({ topic: "x", generator, model: "claude-sonnet-4-6", db, maxAttempts: 1 });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.stage).toBe("parsing");
+      expect(result.attempts).toBe(1);
+    }
+    expect(generator.calls).toHaveLength(1);
+  });
+});
