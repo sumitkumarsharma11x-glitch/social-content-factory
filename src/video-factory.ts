@@ -11,6 +11,7 @@ export interface VideoPlanInput {
   body: string;
   hashtags: string[];
   cta: string;
+  target_duration_seconds?: number;
 }
 
 export interface VideoScene {
@@ -34,42 +35,33 @@ export interface VideoProductionPlan {
 }
 
 function splitSentences(text: string): string[] {
-  return text
-    .replace(/\s+/g, " ")
-    .split(/(?<=[.!?।])\s+/)
-    .map((part) => part.trim())
-    .filter(Boolean);
+  return text.replace(/\s+/g, " ").split(/(?<=[.!?।])\s+/).map((part) => part.trim()).filter(Boolean);
 }
-
 function targetForPlatform(platform: Platform): VideoTarget[] {
   if (platform === "instagram_reel") return ["instagram_reel"];
   if (platform === "youtube_short") return ["youtube_short"];
   return ["facebook_video"];
 }
-
+function sceneDuration(sentence: string): number {
+  const words = sentence.trim().split(/\s+/).filter(Boolean).length;
+  return Math.max(5, Math.min(13, Math.round(words / 2.25)));
+}
+function targetDuration(input: VideoPlanInput): number | undefined {
+  const value = input.target_duration_seconds;
+  if (!Number.isFinite(value)) return undefined;
+  return Math.max(30, Math.min(900, Math.round(value!)));
+}
 export function buildVideoProductionPlan(piece: VideoPlanInput): VideoProductionPlan {
   const sentences = splitSentences(piece.body);
   const usable = sentences.length > 0 ? sentences : [piece.body.trim()];
-  const selected = usable.slice(0, 6);
-  const durationPerScene = selected.length <= 3 ? 5 : 4;
-
-  const scenes = selected.map((sentence, index) => ({
+  const requested = targetDuration(piece);
+  const scenes = usable.map((sentence, index) => ({
     scene_number: index + 1,
-    duration_seconds: durationPerScene,
+    duration_seconds: sceneDuration(sentence),
     voiceover: sentence,
-    visual_prompt: `Create a vertical 9:16 educational visual that clearly illustrates: ${sentence}`,
-    on_screen_text: sentence.length > 90 ? `${sentence.slice(0, 87)}...` : sentence,
+    visual_prompt: `Create a beautiful vertical 9:16 educational visual that clearly illustrates the concept in this narration. Use one strong central illustration, clean labels, simple diagram elements, high readability, no tiny text, no logos, no watermark: ${sentence}`,
+    on_screen_text: sentence.length > 100 ? `${sentence.slice(0, 97)}...` : sentence,
   }));
-
-  return {
-    piece_id: piece.id,
-    source_platform: piece.platform,
-    targets: targetForPlatform(piece.platform),
-    aspect_ratio: "9:16",
-    estimated_duration_seconds: scenes.reduce((sum, scene) => sum + scene.duration_seconds, 0),
-    title: piece.title,
-    voiceover_script: selected.join(" "),
-    scenes,
-    status: "planned",
-  };
+  const estimated = scenes.reduce((sum, scene) => sum + scene.duration_seconds, 0);
+  return { piece_id: piece.id, source_platform: piece.platform, targets: targetForPlatform(piece.platform), aspect_ratio: "9:16", estimated_duration_seconds: requested ?? estimated, title: piece.title, voiceover_script: usable.join(" "), scenes, status: "planned" };
 }
