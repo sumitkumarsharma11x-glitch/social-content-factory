@@ -15,11 +15,11 @@ services:
       - key: GEMINI_MODEL
         sync: false
       - key: GEMINI_TTS_MODEL
-        value: gemini-3.1-flash-tts-preview
+        value: gemini-2.5-flash-preview-tts
       - key: GEMINI_TTS_VOICE
         value: Sulafat
       - key: GEMINI_TTS_RETRIES
-        value: 3
+        value: 1
       - key: GEMINI_IMAGE_MODEL
         value: gemini-3.1-flash-image
       - key: GEMINI_VIDEO_SCRIPT_MODEL
