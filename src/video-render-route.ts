@@ -20,6 +20,12 @@ function toInput(piece: PieceRecord): VideoPlanInput {
   };
 }
 
+function applyDuration(input: VideoPlanInput, targetDurationSeconds?: number): void {
+  if (Number.isFinite(targetDurationSeconds) && (targetDurationSeconds ?? 0) >= 30) {
+    input.target_duration_seconds = Math.min(900, Math.round(targetDurationSeconds!));
+  }
+}
+
 export async function handlePieceVideoRenderRequest(
   pieceId: number,
   publicVideoDir: string,
@@ -34,9 +40,7 @@ export async function handlePieceVideoRenderRequest(
 
   try {
     const input = toInput(piece);
-    if (Number.isFinite(targetDurationSeconds) && (targetDurationSeconds ?? 0) >= 30) {
-      input.target_duration_seconds = Math.min(900, Math.round(targetDurationSeconds!));
-    }
+    applyDuration(input, targetDurationSeconds);
     return { status: 200, result: { ok: true, video: await renderVideoForPiece(input, publicVideoDir) } };
   } catch (error) {
     return { status: 500, result: { ok: false, message: error instanceof Error ? error.message : "Video rendering failed." } };
@@ -48,22 +52,38 @@ export async function handleBatchVideoRenderRequest(
   publicVideoDir: string,
   deps: { db: Database.Database },
   targetDurationSeconds?: number,
+  pieceIds?: number[],
 ): Promise<{ status: number; result: VideoBatchRenderSuccess | VideoRenderFailure }> {
   const batch = getBatch(deps.db, batchId);
   if (!batch) return { status: 404, result: { ok: false, message: `Batch ${batchId} was not found.` } };
-  if (batch.status !== "approved") return { status: 409, result: { ok: false, message: `Batch ${batchId} must be approved before video creation. Current status: ${batch.status}.` } };
 
-  const pieces = listPieces(deps.db, batchId);
+  const allPieces = listPieces(deps.db, batchId);
+  const requestedIds = pieceIds?.length ? [...new Set(pieceIds.filter((id) => Number.isInteger(id) && id > 0))] : null;
+  const pieces = requestedIds
+    ? requestedIds.map((id) => allPieces.find((piece) => piece.id === id)).filter((piece): piece is PieceRecord => Boolean(piece))
+    : allPieces;
+
+  if (!pieces.length) return { status: 400, result: { ok: false, message: "Select at least one piece for video creation." } };
+  if (requestedIds && pieces.length !== requestedIds.length) {
+    return { status: 400, result: { ok: false, message: "One or more selected pieces do not belong to this batch." } };
+  }
+
   const unapproved = pieces.filter((piece) => piece.status !== "approved");
-  if (unapproved.length) return { status: 409, result: { ok: false, message: `${unapproved.length} piece(s) are not approved yet.` } };
+  if (unapproved.length) {
+    return { status: 409, result: { ok: false, message: `${unapproved.length} selected piece(s) are not approved yet.` } };
+  }
+
+  // Full-batch rendering keeps the original safety gate: all 30 must be approved.
+  // Selected rendering intentionally requires only the selected pieces to be approved.
+  if (!requestedIds && batch.status !== "approved") {
+    return { status: 409, result: { ok: false, message: `Batch ${batchId} must be approved before creating all videos. Current status: ${batch.status}.` } };
+  }
 
   try {
     const videos: RenderedVideo[] = [];
     for (const piece of pieces) {
       const input = toInput(piece);
-      if (Number.isFinite(targetDurationSeconds) && (targetDurationSeconds ?? 0) >= 30) {
-        input.target_duration_seconds = Math.min(900, Math.round(targetDurationSeconds!));
-      }
+      applyDuration(input, targetDurationSeconds);
       videos.push(await renderVideoForPiece(input, publicVideoDir));
     }
     return { status: 200, result: { ok: true, batchId, videos } };
@@ -89,7 +109,8 @@ export function registerVideoRenderRoutes(router: Router, db: Database.Database,
       res.status(400).json({ ok: false, message: "batchId must be a positive integer." });
       return;
     }
-    const { status, result } = await handleBatchVideoRenderRequest(batchId, publicVideoDir, { db }, Number(req.body?.duration_seconds));
+    const rawIds = Array.isArray(req.body?.piece_ids) ? req.body.piece_ids.map(Number) : undefined;
+    const { status, result } = await handleBatchVideoRenderRequest(batchId, publicVideoDir, { db }, Number(req.body?.duration_seconds), rawIds);
     res.status(status).json(result);
   });
 }
